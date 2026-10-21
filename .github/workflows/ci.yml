@@ -29,14 +29,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - name: Outils (spa-json-dump, lua)
-        run: sudo apt-get update && sudo apt-get install -y lua5.4 && (sudo apt-get install -y pipewire-bin || true)
+      - name: Outils (spa-json-dump)
+        run: sudo apt-get update && (sudo apt-get install -y pipewire-bin || true)
       - run: bash tests/test-config.sh
       - name: SPA-JSON valide
         run: |
           command -v spa-json-dump || { echo "spa-json-dump absent"; exit 0; }
           export PW_OUT_CONF="$PWD/pw-out.conf"
-          python3 files/rock-n-roll-pw-out generate /tmp/g 192.168.1.113 0.5
-          for f in /tmp/g/pipewire/rock-n-roll-out.conf /tmp/g/pipewire/pipewire.conf.d/*.conf /tmp/g/wireplumber/wireplumber.conf.d/*.conf; do
+          python3 files/rock-n-roll-pw-out generate /tmp/g 192.168.1.113
+          for f in /tmp/g/pipewire/rock-n-roll-out.conf /tmp/g/pipewire/pipewire.conf.d/*.conf; do
             spa-json-dump "$f" >/dev/null && echo "ok : $f"
           done

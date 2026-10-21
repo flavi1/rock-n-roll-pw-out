@@ -36,8 +36,11 @@ PW_CONF_NAME = "rock-n-roll-out.conf"
 NODE_NAME = "rock-n-roll-out"            # sortie « Hifi » (horloge propre, 192 kHz)
 RTP_NODE = "rock-n-roll-out.rtp"         # émetteur : capture le moniteur de la sortie
 PC_PW = "pipewire/pipewire.conf.d/60-rock-n-roll-out.conf"
-PC_WP05 = "wireplumber/wireplumber.conf.d/60-rock-n-roll-out-spdif.conf"
-PC_WP04 = "wireplumber/main.lua.d/60-rock-n-roll-out-spdif.lua"
+# Anciennes versions : règle S/PDIF installée d'office (retirée : propre à chaque PC,
+# voir README « Fixer la fréquence d'une carte son »). Supprimées à « apply ».
+OLD_FILES = ("wireplumber/wireplumber.conf.d/60-rock-n-roll-out-spdif.conf",
+             "wireplumber/main.lua.d/60-rock-n-roll-out-spdif.lua")
+OBSOLETE = {("pc", "spdif-rate"), ("pc", "spdif-match")}
 HEADER = ("# Généré par rock-n-roll-pw-out depuis %s\n"
           "# NE PAS ÉDITER : modifiez le fichier source puis lancez « rock-n-roll-pw-out apply ».\n\n")
 
@@ -45,8 +48,7 @@ DEFAULTS = {
     "rtp": {"host": "hifi.local", "port": "46000", "rate": "192000", "format": "S24BE",
             "channels": "2", "ptime-ms": "1", "latency-ms": "10", "hold": "no",
             "description": "Hifi — réseau (RTP 192 kHz)", "log-level": "2"},
-    "pc": {"spdif-rate": "96000", "spdif-match": r"~alsa_output\..*iec958.*",
-           "allowed-rates": "44100 48000 88200 96000 176400 192000"},
+    "pc": {"allowed-rates": "44100 48000 88200 96000 176400 192000"},
 }
 RATES = (44100, 48000, 88200, 96000, 176400, 192000)
 FORMATS = {"S16BE": 2, "S24BE": 3}
@@ -75,10 +77,14 @@ class Config:
             die("erreur de syntaxe dans %s :\n%s" % (path, e))
         self.path = path
         self.v = {s: dict(d) for s, d in DEFAULTS.items()}
+        self.obsolete = []
         for sec in cp.sections():
             if sec not in self.v:
                 die("section inconnue : [%s]" % sec)
             for k, val in cp.items(sec):
+                if (sec, k) in OBSOLETE:
+                    self.obsolete.append("[%s] %s" % (sec, k))
+                    continue
                 if k not in self.v[sec]:
                     die("[%s] option inconnue : %s" % (sec, k))
                 self.v[sec][k] = val.strip()
@@ -101,9 +107,6 @@ class Config:
         self.packet = self.frames * FORMATS[r["format"]] * int(r["channels"]) + IP_UDP_RTP
         if self.packet > MTU:
             die("[rtp] paquets de %d octets > %d (fragmentation) : réduisez ptime-ms" % (self.packet, MTU))
-        if p["spdif-rate"].lower() != "no" and (not p["spdif-rate"].isdigit()
-                                                or int(p["spdif-rate"]) not in RATES):
-            die("[pc] spdif-rate doit valoir no ou %s" % ", ".join(map(str, RATES)))
         rates = p["allowed-rates"].replace(",", " ").split()
         if not rates or any(not x.isdigit() or int(x) not in RATES for x in rates):
             die("[pc] allowed-rates : liste parmi %s" % ", ".join(map(str, RATES)))
@@ -154,7 +157,7 @@ def gen_sender(c, ip):
     """Processus PipeWire à part : l'émetteur RTP. Il ne convertit rien : il capture
     le moniteur de la sortie « Hifi », qui a sa propre horloge à la fréquence RTP.
     (Avant : l'émetteur était lui-même la sortie ; piloté par une carte son à une
-    autre fréquence, le S/PDIF à 96 kHz, il convertissait et perdait des paquets.)"""
+    autre fréquence (ex. S/PDIF fixé à 96 kHz), il convertissait et perdait des paquets.)"""
     r = c.rtp
     ptime = int(r["ptime-ms"])
     stream = {
@@ -209,7 +212,7 @@ def gen_sender(c, ip):
 def gen_pc_pipewire(c):
     """Fréquences autorisées + la sortie « Hifi » : sortie virtuelle qui est sa
     propre horloge, à la fréquence RTP. Les applications y sont converties une
-    seule fois ; elle ne partage pas l'horloge de la carte son (S/PDIF à 96 kHz)."""
+    seule fois ; elle ne partage pas l'horloge de la carte son du PC."""
     r = c.rtp
     sink = {
         "factory.name": "support.null-audio-sink",
@@ -236,33 +239,6 @@ def gen_pc_pipewire(c):
     })
 
 
-def spdif_on(c):
-    return c.pc["spdif-rate"].lower() != "no"
-
-
-def gen_wp05(c):
-    m = c.pc["spdif-match"]
-    return doc(c, {"monitor.alsa.rules": [{
-        "matches": [{"node.name": m}],
-        "actions": {"update-props": {"audio.rate": int(c.pc["spdif-rate"])}},
-    }]})
-
-
-def glob_of(m):
-    """motif « ~regex » (WirePlumber 0.5) -> motif « matches » de WirePlumber 0.4"""
-    if not m.startswith("~"):
-        return m
-    return m[1:].replace("\\.", ".").replace(".*", "*")
-
-
-def gen_wp04(c):
-    return (HEADER.replace("# ", "-- ") % c.path).replace("\n\n", "\n") + \
-        "table.insert(alsa_monitor.rules, {\n" \
-        "  matches = { { { \"node.name\", \"matches\", %s } } },\n" \
-        "  apply_properties = { [\"audio.rate\"] = %d },\n" \
-        "})\n" % (json.dumps(glob_of(c.pc["spdif-match"])), int(c.pc["spdif-rate"]))
-
-
 def gen_unit():
     return """# Généré par rock-n-roll-pw-out
 # Émetteur RTP vers la Pi, dans un processus PipeWire à part. L'adresse de la Pi
@@ -284,25 +260,11 @@ WantedBy=default.target
 """.replace("{conf}", PW_CONF_NAME)
 
 
-def wp_major_minor():
-    try:
-        out = subprocess.run(["wireplumber", "--version"], text=True, capture_output=True).stdout
-    except OSError:
-        return None
-    m = re.search(r"(\d+)\.(\d+)\.\d+", out)
-    return (int(m.group(1)), int(m.group(2))) if m else None
-
-
-def pc_files(c, wp=None):
+def pc_files(c):
     """fichiers de la partie « PC » (relatifs à ~/.config) -> contenu ou None (à supprimer)"""
-    wp = wp or wp_major_minor() or (0, 5)
-    old_wp = wp < (0, 5)
-    on = spdif_on(c)
-    return {
-        PC_PW: gen_pc_pipewire(c),
-        PC_WP05: gen_wp05(c) if on and not old_wp else None,
-        PC_WP04: gen_wp04(c) if on and old_wp else None,
-    }
+    files = {PC_PW: gen_pc_pipewire(c)}
+    files.update({f: None for f in OLD_FILES})
+    return files
 
 
 # --- résolution de l'adresse de la Pi -------------------------------------------------
@@ -345,7 +307,8 @@ def cmd_check(c):
     print("  format      : %s Hz %s %s canaux, paquets de %s ms (%d octets), tampon %s ms%s" % (
         r["rate"], r["format"], r["channels"], r["ptime-ms"], c.packet, r["latency-ms"],
         ", place gardée même sans son" if yes(r["hold"]) else ""))
-    print("  S/PDIF      : %s" % ("%s Hz fixe" % c.pc["spdif-rate"] if spdif_on(c) else "non modifié"))
+    for o in c.obsolete:
+        print("  ignoré      : %s (n'existe plus : voir README, « Fixer la fréquence d'une carte son »)" % o)
 
 
 def cmd_prepare(c):
@@ -357,9 +320,9 @@ def cmd_prepare(c):
     print("rock-n-roll-pw-out : envoi vers %s (%s), port %s" % (c.rtp["host"], ip, c.rtp["port"]))
 
 
-def cmd_generate(c, outdir, ip="192.0.2.10", wp=None):
+def cmd_generate(c, outdir, ip="192.0.2.10"):
     files = {"pipewire/" + PW_CONF_NAME: gen_sender(c, ip), "systemd/user/" + UNIT: gen_unit()}
-    files.update(pc_files(c, wp))
+    files.update(pc_files(c))
     for rel, content in files.items():
         if content is None:
             continue
@@ -387,8 +350,8 @@ def cmd_apply(c, restart_pipewire=None):
     if restart_pipewire is None:
         restart_pipewire = changed
     if restart_pipewire:
-        # fréquences autorisées / S/PDIF : lus au démarrage de PipeWire (coupure d'1 s)
-        print("  redémarrage de PipeWire (fréquences, S/PDIF)")
+        # sortie « Hifi », fréquences autorisées : lues au démarrage de PipeWire (coupure d'1 s)
+        print("  redémarrage de PipeWire (sortie « Hifi », fréquences)")
         user_ctl("restart", "wireplumber", "pipewire", "pipewire-pulse")
         time.sleep(2)
     r = user_ctl("restart", UNIT)
@@ -479,9 +442,8 @@ def main():
         cmd_prepare(c)
     elif a[0] == "generate":
         if len(a) < 2:
-            die("usage : rock-n-roll-pw-out generate DOSSIER [IP] [VERSION-WIREPLUMBER]")
-        wp = tuple(int(x) for x in a[3].split(".")[:2]) if len(a) > 3 else None
-        cmd_generate(c, a[1], a[2] if len(a) > 2 else "192.0.2.10", wp)
+            die("usage : rock-n-roll-pw-out generate DOSSIER [IP]")
+        cmd_generate(c, a[1], a[2] if len(a) > 2 else "192.0.2.10")
     elif a[0] == "apply":
         cmd_apply(c, True if "--restart-pipewire" in a else None)
     elif a[0] == "default":

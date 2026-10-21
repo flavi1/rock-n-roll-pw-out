@@ -14,6 +14,6 @@ rm -f "$C/systemd/user/rock-n-roll-out.service" \
       "$HOME/.local/bin/rock-n-roll-pw-out"
 [[ "${1:-}" != --purge ]] || rm -rf "$C/rock-n-roll-pw-out"
 systemctl --user daemon-reload
-echo "Redémarrage de PipeWire (fréquences et S/PDIF d'origine)"
+echo "Redémarrage de PipeWire (sans la sortie « Hifi »)"
 systemctl --user restart wireplumber pipewire pipewire-pulse || true
 echo "rock-n-roll-pw-out désinstallé."

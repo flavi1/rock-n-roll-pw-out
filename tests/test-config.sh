@@ -12,9 +12,9 @@ fail() { echo "  FAIL : $*"; FAILS=$((FAILS+1)); }
 export PW_OUT_CONF="$W/pw-out.conf"
 cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
 
-echo "== check / generate (WirePlumber 0.5)"
+echo "== check / generate"
 "${CMD[@]}" check >/dev/null && ok "check" || fail "check"
-"${CMD[@]}" generate "$W/g" 192.168.1.113 0.5 >/dev/null && ok "generate" || fail "generate"
+"${CMD[@]}" generate "$W/g" 192.168.1.113 >/dev/null && ok "generate" || fail "generate"
 S="$W/g/pipewire/rock-n-roll-out.conf"
 grep -q 'libpipewire-module-rtp-sink' "$S" && ok "module rtp-sink" || fail "rtp-sink"
 grep -q 'destination.ip = "192.168.1.113"' "$S" && ok "vers l'adresse résolue" || fail "destination.ip"
@@ -36,28 +36,27 @@ grep -q 'ExecStartPre=%h/.local/bin/rock-n-roll-pw-out prepare' "$W/g/systemd/us
     && ok "adresse résolue à chaque démarrage" || fail "ExecStartPre"
 grep -q 'default.clock.allowed-rates = \[ 44100 48000 88200 96000 176400 192000 \]' \
     "$W/g/pipewire/pipewire.conf.d/60-rock-n-roll-out.conf" && ok "fréquences autorisées" || fail "allowed-rates"
-WP="$W/g/wireplumber/wireplumber.conf.d/60-rock-n-roll-out-spdif.conf"
-grep -q 'audio.rate = 96000' "$WP" && ok "S/PDIF 96 kHz (règle WirePlumber 0.5)" || fail "S/PDIF 0.5"
-[[ ! -e "$W/g/wireplumber/main.lua.d/60-rock-n-roll-out-spdif.lua" ]] && ok "pas de règle Lua en 0.5" || fail "Lua en 0.5"
+[[ ! -e "$W/g/wireplumber" ]] && ok "aucune règle de carte son (propre à chaque PC)" || fail "règle WirePlumber générée"
 
-echo "== WirePlumber 0.4 (Lua)"
-"${CMD[@]}" generate "$W/g4" 192.168.1.113 0.4 >/dev/null
-L="$W/g4/wireplumber/main.lua.d/60-rock-n-roll-out-spdif.lua"
-grep -q '"alsa_output.\*iec958\*"' "$L" && grep -q '\["audio.rate"\] = 96000' "$L" && ok "règle Lua (motif glob)" || fail "Lua 0.4"
-[[ ! -e "$W/g4/wireplumber/wireplumber.conf.d/60-rock-n-roll-out-spdif.conf" ]] && ok "pas de règle 0.5" || fail "0.5 en 0.4"
-if command -v lua >/dev/null || command -v lua5.4 >/dev/null; then
-    LUA="$(command -v lua || command -v lua5.4)"
-    printf 'alsa_monitor = { rules = {} }\ndofile(arg[1])\nassert(#alsa_monitor.rules == 1)\n' > "$W/t.lua"
-    "$LUA" "$W/t.lua" "$L" && ok "Lua exécutable" || fail "Lua invalide"
-fi
+echo "== ancienne configuration (règle S/PDIF)"
+printf 'spdif-rate = 96000\nspdif-match = ~alsa_output\\..*iec958.*\n' >> "$PW_OUT_CONF"
+"${CMD[@]}" check | grep -q "ignoré      : \[pc\] spdif-rate" && ok "anciennes options ignorées, signalées" || fail "anciennes options"
+python3 - "$HERE/files/rock-n-roll-pw-out" "$PW_OUT_CONF" <<'PY' && ok "anciennes règles S/PDIF supprimées à « apply »" || fail "OLD_FILES"
+import importlib.machinery, importlib.util, os, sys
+os.environ["PW_OUT_CONF"] = sys.argv[2]
+loader = importlib.machinery.SourceFileLoader("o", sys.argv[1])
+spec = importlib.util.spec_from_loader("o", loader); m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+f = m.pc_files(m.Config(sys.argv[2]))
+assert all(f[x] is None for x in m.OLD_FILES) and f[m.PC_PW]
+PY
+cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
 
 echo "== options"
-sed -i 's/^hold = no/hold = yes/; s/^spdif-rate = 96000/spdif-rate = no/' "$PW_OUT_CONF"
-"${CMD[@]}" generate "$W/g2" 10.0.0.5 0.5 >/dev/null
+sed -i 's/^hold = no/hold = yes/' "$PW_OUT_CONF"
+"${CMD[@]}" generate "$W/g2" 10.0.0.5 >/dev/null
 grep -q 'node.always-process = true' "$W/g2/pipewire/rock-n-roll-out.conf" && ok "hold = yes : silence envoyé" || fail "hold"
 grep -q 'node.passive' "$W/g2/pipewire/rock-n-roll-out.conf" && fail "hold = yes : lien passif" || ok "hold = yes : lien actif"
 grep -q 'node.pause-on-idle = false' "$W/g2/pipewire/pipewire.conf.d/60-rock-n-roll-out.conf" && ok "hold = yes : sortie jamais en veille" || fail "hold sortie"
-[[ ! -e "$W/g2/wireplumber/wireplumber.conf.d/60-rock-n-roll-out-spdif.conf" ]] && ok "spdif-rate = no : S/PDIF non modifié" || fail "spdif no"
 cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
 
 echo "== erreurs détectées"
@@ -81,7 +80,6 @@ spec = importlib.util.spec_from_loader("o", loader); m = importlib.util.module_f
 assert m.resolve("192.168.1.113", 1) == "192.168.1.113"
 assert m.resolve("localhost", 1) == "127.0.0.1"
 assert m.resolve("nexistepas.invalid", 1) is None
-assert m.glob_of(r"~alsa_output\..*iec958.*") == "alsa_output.*iec958*"
 PY
 
 echo "== install.sh : options écrites dans pw-out.conf"

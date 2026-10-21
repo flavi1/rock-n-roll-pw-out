@@ -7,7 +7,7 @@
 #  À lancer SANS sudo, avec votre compte (celui qui écoute la musique) :
 #
 #     bash install.sh [--host hifi.local] [--port 46000]
-#                     [--spdif-rate 96000|no] [--hold yes|no] [--default]
+#                     [--hold yes|no] [--default]
 #
 #  Ajoute une sortie « Hifi — réseau (RTP 192 kHz) » dans les réglages du son
 #  (--default : en fait la sortie par défaut).
@@ -32,7 +32,6 @@ while [[ $# -gt 0 ]]; do
         --host) SET[rtp.host]="${2:?}"; shift 2 ;;
         --port) SET[rtp.port]="${2:?}"; shift 2 ;;
         --hold) SET[rtp.hold]="${2:?}"; shift 2 ;;
-        --spdif-rate) SET[pc.spdif-rate]="${2:?}"; shift 2 ;;
         --default) MAKE_DEFAULT=1; shift ;;
         -h|--help) sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "option inconnue : $1 (--help)" ;;
