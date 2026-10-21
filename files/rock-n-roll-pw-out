@@ -1,0 +1,453 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+# =============================================================================
+#  rock-n-roll-pw-out — envoi du son du PC vers la Raspberry Pi (RTP 192 kHz)
+#
+#  Configuration : ~/.config/rock-n-roll-pw-out/pw-out.conf
+#
+#  rock-n-roll-pw-out apply      régénère la configuration et relance l'envoi
+#                                (+ PipeWire si la partie « PC » a changé)
+#  rock-n-roll-pw-out status     état de l'envoi
+#  rock-n-roll-pw-out default    fait de « Hifi » la sortie son par défaut
+#  rock-n-roll-pw-out check      valide la configuration
+#  rock-n-roll-pw-out prepare    résout l'adresse de la Pi et écrit la config
+#                                de l'émetteur (lancé à chaque démarrage)
+#  rock-n-roll-pw-out generate DIR [IP]   fichiers générés dans DIR (tests)
+#
+#  L'émetteur tourne dans un processus PipeWire à part (service utilisateur
+#  rock-n-roll-out) : sa sortie « Hifi » apparaît dans les réglages du son.
+#  Sans utilisateur root, sans rien installer hors de votre dossier personnel.
+# =============================================================================
+import configparser
+import json
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+XDG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
+CONF = os.environ.get("PW_OUT_CONF", os.path.join(XDG, "rock-n-roll-pw-out", "pw-out.conf"))
+UNIT = "rock-n-roll-out.service"
+PW_CONF_NAME = "rock-n-roll-out.conf"
+NODE_NAME = "rock-n-roll-out"
+PC_PW = "pipewire/pipewire.conf.d/60-rock-n-roll-out.conf"
+PC_WP05 = "wireplumber/wireplumber.conf.d/60-rock-n-roll-out-spdif.conf"
+PC_WP04 = "wireplumber/main.lua.d/60-rock-n-roll-out-spdif.lua"
+HEADER = ("# Généré par rock-n-roll-pw-out depuis %s\n"
+          "# NE PAS ÉDITER : modifiez le fichier source puis lancez « rock-n-roll-pw-out apply ».\n\n")
+
+DEFAULTS = {
+    "rtp": {"host": "hifi.local", "port": "46000", "rate": "192000", "format": "S24BE",
+            "channels": "2", "ptime-ms": "1", "latency-ms": "10", "hold": "no",
+            "description": "Hifi — réseau (RTP 192 kHz)"},
+    "pc": {"spdif-rate": "96000", "spdif-match": r"~alsa_output\..*iec958.*",
+           "allowed-rates": "44100 48000 88200 96000 176400 192000"},
+}
+RATES = (44100, 48000, 88200, 96000, 176400, 192000)
+FORMATS = {"S16BE": 2, "S24BE": 3}
+IP_UDP_RTP = 20 + 8 + 12
+MTU = 1280            # net.mtu de PipeWire par défaut (= taille du tampon de réception de la Pi)
+
+
+def die(msg):
+    print("rock-n-roll-pw-out : " + msg, file=sys.stderr)
+    sys.exit(1)
+
+
+def yes(v):
+    return str(v).strip().lower() in ("1", "yes", "true", "on", "oui")
+
+
+class Config:
+    def __init__(self, path=CONF):
+        if not os.path.exists(path):
+            die("fichier introuvable : %s (lancez install.sh)" % path)
+        cp = configparser.ConfigParser(interpolation=None, strict=True)
+        cp.optionxform = str
+        try:
+            cp.read(path, encoding="utf-8")
+        except configparser.Error as e:
+            die("erreur de syntaxe dans %s :\n%s" % (path, e))
+        self.path = path
+        self.v = {s: dict(d) for s, d in DEFAULTS.items()}
+        for sec in cp.sections():
+            if sec not in self.v:
+                die("section inconnue : [%s]" % sec)
+            for k, val in cp.items(sec):
+                if k not in self.v[sec]:
+                    die("[%s] option inconnue : %s" % (sec, k))
+                self.v[sec][k] = val.strip()
+        r, p = self.v["rtp"], self.v["pc"]
+        for k, lo, hi in (("port", 1024, 65535), ("channels", 1, 8), ("latency-ms", 1, 1000),
+                          ("ptime-ms", 1, 20)):
+            if not r[k].isdigit() or not lo <= int(r[k]) <= hi:
+                die("[rtp] %s doit être un entier entre %d et %d" % (k, lo, hi))
+        if not r["rate"].isdigit() or int(r["rate"]) not in RATES:
+            die("[rtp] rate doit valoir %s" % ", ".join(map(str, RATES)))
+        if r["format"] not in FORMATS:
+            die("[rtp] format doit valoir %s" % " ou ".join(FORMATS))
+        if int(r["latency-ms"]) % int(r["ptime-ms"]):
+            die("[rtp] latency-ms doit être un multiple de ptime-ms")
+        if not r["host"] or any(ch.isspace() for ch in r["host"]):
+            die("[rtp] host invalide")
+        self.frames = int(r["rate"]) * int(r["ptime-ms"]) // 1000
+        self.packet = self.frames * FORMATS[r["format"]] * int(r["channels"]) + IP_UDP_RTP
+        if self.packet > MTU:
+            die("[rtp] paquets de %d octets > %d (fragmentation) : réduisez ptime-ms" % (self.packet, MTU))
+        if p["spdif-rate"].lower() != "no" and (not p["spdif-rate"].isdigit()
+                                                or int(p["spdif-rate"]) not in RATES):
+            die("[pc] spdif-rate doit valoir no ou %s" % ", ".join(map(str, RATES)))
+        rates = p["allowed-rates"].replace(",", " ").split()
+        if not rates or any(not x.isdigit() or int(x) not in RATES for x in rates):
+            die("[pc] allowed-rates : liste parmi %s" % ", ".join(map(str, RATES)))
+        self.allowed = [int(x) for x in rates]
+        if int(r["rate"]) not in self.allowed:
+            self.allowed = sorted(set(self.allowed) | {int(r["rate"])})
+
+    @property
+    def rtp(self):
+        return self.v["rtp"]
+
+    @property
+    def pc(self):
+        return self.v["pc"]
+
+
+# --- SPA-JSON ------------------------------------------------------------------------
+def spa(v, ind=0):
+    pad, pad2 = "    " * ind, "    " * (ind + 1)
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        if all(not isinstance(x, (dict, list)) for x in v):
+            return "[ " + " ".join(spa(x) for x in v) + " ]"
+        return "[\n" + "".join(pad2 + spa(x, ind + 1) + "\n" for x in v) + pad + "]"
+    if isinstance(v, dict):
+        out = "{\n"
+        for k, x in v.items():
+            key = k if re.fullmatch(r"[A-Za-z0-9_.\-]+", k) else json.dumps(k)
+            out += "%s%s = %s\n" % (pad2, key, spa(x, ind + 1))
+        return out + pad + "}"
+    raise TypeError(v)
+
+
+def doc(c, d):
+    return HEADER % c.path + "".join("%s = %s\n\n" % (k, spa(v)) for k, v in d.items())
+
+
+def positions(n):
+    return ["FL", "FR"] if n == 2 else (["MONO"] if n == 1 else ["AUX%d" % i for i in range(n)])
+
+
+def gen_sender(c, ip):
+    """Processus PipeWire à part : l'émetteur RTP (une sortie « Hifi »)."""
+    r = c.rtp
+    ptime = int(r["ptime-ms"])
+    stream = {
+        "node.name": NODE_NAME,
+        "node.description": r["description"],
+        "media.class": "Audio/Sink",
+    }
+    if yes(r["hold"]):
+        # envoyer (du silence) même quand rien ne joue : la Pi reste à ce PC
+        stream["node.always-process"] = True
+        stream["session.suspend-timeout-seconds"] = 0
+    return doc(c, {
+        "context.properties": {"log.level": 0},
+        "context.spa-libs": {
+            "audio.convert.*": "audioconvert/libspa-audioconvert",
+            "support.*": "support/libspa-support",
+        },
+        "context.modules": [
+            {"name": "libpipewire-module-rt", "args": {}, "flags": ["ifexists", "nofail"]},
+            {"name": "libpipewire-module-protocol-native"},
+            {"name": "libpipewire-module-client-node"},
+            {"name": "libpipewire-module-adapter"},
+            {"name": "libpipewire-module-rtp-sink",
+             "args": {
+                 "destination.ip": ip,
+                 "destination.port": int(r["port"]),
+                 "sess.name": "rock-n-roll " + socket.gethostname(),
+                 "sess.media": "audio",
+                 # paquets de ptime ms : sous la taille d'un paquet Ethernet
+                 "sess.min-ptime": ptime,
+                 "sess.max-ptime": ptime,
+                 "rtp.ptime": ptime,
+                 "sess.latency.msec": int(r["latency-ms"]),
+                 "net.mtu": MTU,
+                 "audio.format": r["format"],
+                 "audio.rate": int(r["rate"]),
+                 "audio.channels": int(r["channels"]),
+                 "audio.position": positions(int(r["channels"])),
+                 "stream.props": stream,
+             }},
+        ],
+    })
+
+
+def gen_pc_pipewire(c):
+    return doc(c, {"context.properties": {"default.clock.allowed-rates": c.allowed}})
+
+
+def spdif_on(c):
+    return c.pc["spdif-rate"].lower() != "no"
+
+
+def gen_wp05(c):
+    m = c.pc["spdif-match"]
+    return doc(c, {"monitor.alsa.rules": [{
+        "matches": [{"node.name": m}],
+        "actions": {"update-props": {"audio.rate": int(c.pc["spdif-rate"])}},
+    }]})
+
+
+def glob_of(m):
+    """motif « ~regex » (WirePlumber 0.5) -> motif « matches » de WirePlumber 0.4"""
+    if not m.startswith("~"):
+        return m
+    return m[1:].replace("\\.", ".").replace(".*", "*")
+
+
+def gen_wp04(c):
+    return (HEADER.replace("# ", "-- ") % c.path).replace("\n\n", "\n") + \
+        "table.insert(alsa_monitor.rules, {\n" \
+        "  matches = { { { \"node.name\", \"matches\", %s } } },\n" \
+        "  apply_properties = { [\"audio.rate\"] = %d },\n" \
+        "})\n" % (json.dumps(glob_of(c.pc["spdif-match"])), int(c.pc["spdif-rate"]))
+
+
+def gen_unit():
+    return """# Généré par rock-n-roll-pw-out
+# Émetteur RTP vers la Pi, dans un processus PipeWire à part. L'adresse de la Pi
+# est résolue à chaque démarrage (ExecStartPre).
+[Unit]
+Description=rock-n-roll : envoi du son vers la Pi (RTP)
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+PartOf=pipewire.service
+
+[Service]
+ExecStartPre=%h/.local/bin/rock-n-roll-pw-out prepare
+ExecStart=/usr/bin/pipewire -c {conf}
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+""".replace("{conf}", PW_CONF_NAME)
+
+
+def wp_major_minor():
+    try:
+        out = subprocess.run(["wireplumber", "--version"], text=True, capture_output=True).stdout
+    except OSError:
+        return None
+    m = re.search(r"(\d+)\.(\d+)\.\d+", out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def pc_files(c, wp=None):
+    """fichiers de la partie « PC » (relatifs à ~/.config) -> contenu ou None (à supprimer)"""
+    wp = wp or wp_major_minor() or (0, 5)
+    old_wp = wp < (0, 5)
+    on = spdif_on(c)
+    return {
+        PC_PW: gen_pc_pipewire(c),
+        PC_WP05: gen_wp05(c) if on and not old_wp else None,
+        PC_WP04: gen_wp04(c) if on and old_wp else None,
+    }
+
+
+# --- résolution de l'adresse de la Pi -------------------------------------------------
+def resolve(host, tries=30):
+    try:
+        socket.inet_aton(host)
+        if host.count(".") == 3:
+            return host
+    except OSError:
+        pass
+    for i in range(tries):
+        try:
+            infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+            if infos:
+                return infos[0][4][0]
+        except socket.gaierror:
+            pass
+        if i + 1 < tries:
+            time.sleep(1)
+    return None
+
+
+def write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.replace(tmp, path)
+
+
+def user_ctl(*args, check=False):
+    return subprocess.run(["systemctl", "--user"] + list(args), text=True, capture_output=True, check=check)
+
+
+# --- commandes ---------------------------------------------------------------------------
+def cmd_check(c):
+    r = c.rtp
+    print("Configuration valide : %s" % c.path)
+    print("  vers        : %s, port UDP %s" % (r["host"], r["port"]))
+    print("  format      : %s Hz %s %s canaux, paquets de %s ms (%d octets), tampon %s ms%s" % (
+        r["rate"], r["format"], r["channels"], r["ptime-ms"], c.packet, r["latency-ms"],
+        ", place gardée même sans son" if yes(r["hold"]) else ""))
+    print("  S/PDIF      : %s" % ("%s Hz fixe" % c.pc["spdif-rate"] if spdif_on(c) else "non modifié"))
+
+
+def cmd_prepare(c):
+    ip = resolve(c.rtp["host"])
+    if not ip:
+        die("« %s » introuvable sur le réseau (Pi éteinte ? essayez son adresse IP : "
+            "install.sh --host 192.168.1.x)" % c.rtp["host"])
+    write(os.path.join(XDG, "pipewire", PW_CONF_NAME), gen_sender(c, ip))
+    print("rock-n-roll-pw-out : envoi vers %s (%s), port %s" % (c.rtp["host"], ip, c.rtp["port"]))
+
+
+def cmd_generate(c, outdir, ip="192.0.2.10", wp=None):
+    files = {"pipewire/" + PW_CONF_NAME: gen_sender(c, ip), "systemd/user/" + UNIT: gen_unit()}
+    files.update(pc_files(c, wp))
+    for rel, content in files.items():
+        if content is None:
+            continue
+        p = os.path.join(outdir, rel)
+        write(p, content)
+        print("écrit", p)
+
+
+def cmd_apply(c, restart_pipewire=None):
+    cmd_check(c)
+    changed = False
+    for rel, content in pc_files(c).items():
+        p = os.path.join(XDG, rel)
+        old = open(p, encoding="utf-8").read() if os.path.exists(p) else None
+        if content is None:
+            if old is not None:
+                os.remove(p)
+                changed = True
+        elif old != content:
+            write(p, content)
+            changed = True
+    write(os.path.join(XDG, "systemd", "user", UNIT), gen_unit())
+    user_ctl("daemon-reload")
+    user_ctl("enable", UNIT)
+    if restart_pipewire is None:
+        restart_pipewire = changed
+    if restart_pipewire:
+        # fréquences autorisées / S/PDIF : lus au démarrage de PipeWire (coupure d'1 s)
+        print("  redémarrage de PipeWire (fréquences, S/PDIF)")
+        user_ctl("restart", "wireplumber", "pipewire", "pipewire-pulse")
+        time.sleep(2)
+    r = user_ctl("restart", UNIT)
+    if r.returncode != 0:
+        j = subprocess.run(["journalctl", "--user", "-u", UNIT, "-n", "5", "-o", "cat", "--no-pager"],
+                           text=True, capture_output=True).stdout
+        die("l'envoi n'a pas démarré :\n" + j)
+    time.sleep(1)
+    print("  sortie « %s » prête : choisissez-la dans les réglages du son" % c.rtp["description"])
+
+
+def node_state():
+    try:
+        objs = json.loads(subprocess.run(["pw-dump"], text=True, capture_output=True, timeout=10).stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    for o in objs:
+        info = o.get("info") or {}
+        if (info.get("props") or {}).get("node.name") == NODE_NAME:
+            return info.get("state", "?")
+    return False
+
+
+def default_sink():
+    try:
+        out = subprocess.run(["wpctl", "inspect", "@DEFAULT_AUDIO_SINK@"], text=True,
+                             capture_output=True, timeout=10).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    m = re.search(r'node\.name = "([^"]+)"', out)
+    return m.group(1) if m else None
+
+
+def node_id():
+    try:
+        objs = json.loads(subprocess.run(["pw-dump"], text=True, capture_output=True, timeout=10).stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+    for o in objs:
+        if ((o.get("info") or {}).get("props") or {}).get("node.name") == NODE_NAME:
+            return o.get("id")
+    return None
+
+
+def cmd_default(c):
+    for _ in range(10):
+        i = node_id()
+        if i is not None:
+            break
+        time.sleep(1)
+    else:
+        die("sortie « %s » absente (rock-n-roll-pw-out status)" % c.rtp["description"])
+    if subprocess.run(["wpctl", "set-default", str(i)]).returncode != 0:
+        die("wpctl set-default a échoué")
+    print("  « %s » est la sortie par défaut" % c.rtp["description"])
+
+
+def cmd_status(c):
+    cmd_check(c)
+    print("  service     : %s" % (user_ctl("is-active", UNIT).stdout.strip() or "inconnu"))
+    p = os.path.join(XDG, "pipewire", PW_CONF_NAME)
+    if os.path.exists(p):
+        m = re.search(r'destination.ip = "([^"]+)"', open(p, encoding="utf-8").read())
+        print("  adresse     : %s" % (m.group(1) if m else "?"))
+    st = node_state()
+    states = {"running": "envoi en cours", "idle": "prête, rien ne joue", "suspended": "en veille (rien ne joue)"}
+    print("  sortie      : %s" % ("PipeWire ne répond pas" if st is None else
+                                   "absente" if st is False else states.get(st, st)))
+    d = default_sink()
+    if d:
+        print("  par défaut  : %s" % ("oui" if d == NODE_NAME else "non (%s)" % d))
+
+
+def main():
+    a = sys.argv[1:]
+    if not a or a[0] in ("-h", "--help", "help"):
+        head = open(__file__, encoding="utf-8").read().split("import configparser")[0]
+        print("\n".join(line[2:] for line in head.splitlines()[1:] if line.startswith("#") and "====" not in line))
+        return
+    c = Config()
+    if a[0] == "check":
+        cmd_check(c)
+    elif a[0] == "prepare":
+        cmd_prepare(c)
+    elif a[0] == "generate":
+        if len(a) < 2:
+            die("usage : rock-n-roll-pw-out generate DOSSIER [IP] [VERSION-WIREPLUMBER]")
+        wp = tuple(int(x) for x in a[3].split(".")[:2]) if len(a) > 3 else None
+        cmd_generate(c, a[1], a[2] if len(a) > 2 else "192.0.2.10", wp)
+    elif a[0] == "apply":
+        cmd_apply(c, True if "--restart-pipewire" in a else None)
+    elif a[0] == "default":
+        cmd_default(c)
+    elif a[0] == "status":
+        cmd_status(c)
+    else:
+        die("commande inconnue : %s (%s)" % (a[0], shlex.quote(" ".join(a))))
+
+
+if __name__ == "__main__":
+    main()
