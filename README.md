@@ -74,7 +74,27 @@ rock-n-roll-pw-out status
 | `« hifi.local » introuvable` | Pi éteinte, ou résolution `.local` absente (paquet `libnss-mdns`) : `bash install.sh --host 192.168.1.113` |
 | Sortie absente | `systemctl --user status rock-n-roll-out`, `journalctl --user -u rock-n-roll-out` |
 | Pas de son sur la Pi | sur la Pi : `sudo rock-n-roll-pw-in status` (un autre PC tient la place ?) |
+| Coupures en Ethernet (pas en Wi-Fi) ; sur la Pi, journal `unexpected seq` et moins de 1000 paquets/s reçus | paquets perdus par la carte réseau du PC, souvent l'économie d'énergie Ethernet (EEE), ex. cartes Intel `e1000e` : `sudo ethtool --show-eee eno1`, essai `sudo ethtool --set-eee eno1 eee off` (jusqu'au redémarrage). Permanent : voir « Couper l'EEE » ci-dessous |
 | Son haché | `pw-top` pendant la lecture : la ligne `rock-n-roll-out` (pilote) doit être à 192000 ; sur la Pi, compter les paquets reçus (≈ 1000/s attendus) ; journal : `log-level = 3` dans `pw-out.conf`, `rock-n-roll-pw-out apply`, `journalctl --user -u rock-n-roll-out -f` ; Wi-Fi chargé : sur la Pi, `latency-ms` plus grand (`local.conf`) |
+
+## Couper l'EEE (économie d'énergie Ethernet) de façon permanente
+
+Propre à la carte réseau et à la box, donc hors de cet outil. Avec NetworkManager
+(Kubuntu, Ubuntu…) : un script relancé à chaque connexion (démarrage, sortie de
+veille, câble rebranché). Remplacer `eno1` par le nom de la carte (`ip -br link`).
+
+1. `sudo nano /etc/NetworkManager/dispatcher.d/50-eee-off`, contenu :
+   ```
+   #!/bin/sh
+   # Coupe l'EEE sur eno1 à chaque connexion (seulement s'il est actif :
+   # le couper relance le lien)
+   [ "$1" = "eno1" ] && [ "$2" = "up" ] || exit 0
+   /usr/sbin/ethtool --show-eee eno1 | grep -q 'EEE status: enabled' && \
+       /usr/sbin/ethtool --set-eee eno1 eee off
+   exit 0
+   ```
+2. `sudo chmod 755 /etc/NetworkManager/dispatcher.d/50-eee-off`
+3. Après un redémarrage : `sudo ethtool --show-eee eno1 | grep status` → `disabled`.
 
 ## Fixer la fréquence d'une carte son (manuel, facultatif)
 
