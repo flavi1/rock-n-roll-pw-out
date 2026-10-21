@@ -77,13 +77,45 @@ rock-n-roll-pw-out status
 | Coupures en Ethernet (pas en Wi-Fi) ; sur la Pi, journal `unexpected seq` et moins de 1000 paquets/s reçus | paquets perdus par la carte réseau du PC, souvent l'économie d'énergie Ethernet (EEE), ex. cartes Intel `e1000e` : `sudo ethtool --show-eee eno1`, essai `sudo ethtool --set-eee eno1 eee off` (jusqu'au redémarrage). Permanent : voir « Couper l'EEE » ci-dessous |
 | Son haché | `pw-top` pendant la lecture : la ligne `rock-n-roll-out` (pilote) doit être à 192000 ; sur la Pi, compter les paquets reçus (≈ 1000/s attendus) ; journal : `log-level = 3` dans `pw-out.conf`, `rock-n-roll-pw-out apply`, `journalctl --user -u rock-n-roll-out -f` ; Wi-Fi chargé : sur la Pi, `latency-ms` plus grand (`local.conf`) |
 
+## Limitations connues
+
+- **Aucune perte de paquet n'est tolérée.** Le son voyage sans compression et sans
+  correction d'erreur : chaque paquet perdu (1 ms de son) provoque une
+  resynchronisation de la Pi, donc une coupure audible. Le réseau doit livrer 100 %
+  des paquets : ~1000 par seconde, 9,2 Mbit/s en continu. Un ping peut être parfait
+  alors que ce flux régulier perd des paquets.
+- **Économie d'énergie Ethernet (EEE) : cause fréquente de pertes.** Certaines cartes
+  réseau (constaté : Intel `e1000e`, derrière une box SFR) perdent environ 13 % des
+  paquets quand l'EEE est actif : coupures en Ethernet, alors qu'un autre PC en Wi-Fi
+  passe sans problème. Remède : couper l'EEE sur le PC (voir « Couper l'EEE »
+  ci-dessous). Ce réglage dépend de la carte et de la box : il n'est pas fait par
+  cet outil.
+- **Wi-Fi** : utilisable si le réseau est stable ; en cas de coupures, augmenter le
+  tampon de la Pi (`latency-ms` dans son `local.conf`).
+- **Une seule Pi par PC**, et un seul PC à la fois par Pi.
+
 ## Couper l'EEE (économie d'énergie Ethernet) de façon permanente
 
-Propre à la carte réseau et à la box, donc hors de cet outil. Avec NetworkManager
-(Kubuntu, Ubuntu…) : un script relancé à chaque connexion (démarrage, sortie de
-veille, câble rebranché). Remplacer `eno1` par le nom de la carte (`ip -br link`).
+Propre à la carte réseau et à la box, donc hors de cet outil.
 
-1. `sudo nano /etc/NetworkManager/dispatcher.d/50-eee-off`, contenu :
+1. Nom de la carte et état de l'EEE :
+   ```
+   ip -br link                                   # ex. eno1, enp3s0
+   sudo ethtool --show-eee eno1 | grep status    # « enabled - active » : concerné
+   ```
+2. Essai, jusqu'au prochain redémarrage : `sudo ethtool --set-eee eno1 eee off`. Si
+   les coupures disparaissent, le rendre permanent (étapes suivantes).
+3. Vérifier que le réseau est géré par **NetworkManager** (Kubuntu, Ubuntu, Fedora…
+   par défaut) :
+   ```
+   systemctl is-active NetworkManager            # doit répondre « active »
+   nmcli -t -f DEVICE,STATE device | grep eno1   # doit répondre « eno1:connected »
+   ```
+   Sinon (systemd-networkd, ifupdown…) : le script ci-dessous ne sera pas lancé ;
+   utiliser l'outil de votre système.
+4. Un script relancé par NetworkManager à chaque connexion (démarrage, sortie de
+   veille, câble rebranché). Remplacer `eno1` par le nom de la carte.
+   `sudo nano /etc/NetworkManager/dispatcher.d/50-eee-off`, contenu :
    ```
    #!/bin/sh
    # Coupe l'EEE sur eno1 à chaque connexion (seulement s'il est actif :
@@ -93,8 +125,8 @@ veille, câble rebranché). Remplacer `eno1` par le nom de la carte (`ip -br lin
        /usr/sbin/ethtool --set-eee eno1 eee off
    exit 0
    ```
-2. `sudo chmod 755 /etc/NetworkManager/dispatcher.d/50-eee-off`
-3. Après un redémarrage : `sudo ethtool --show-eee eno1 | grep status` → `disabled`.
+5. `sudo chmod 755 /etc/NetworkManager/dispatcher.d/50-eee-off`
+6. Après un redémarrage : `sudo ethtool --show-eee eno1 | grep status` → `disabled`.
 
 ## Fixer la fréquence d'une carte son (manuel, facultatif)
 
