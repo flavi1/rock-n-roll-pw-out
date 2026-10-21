@@ -33,7 +33,8 @@ XDG = os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config")
 CONF = os.environ.get("PW_OUT_CONF", os.path.join(XDG, "rock-n-roll-pw-out", "pw-out.conf"))
 UNIT = "rock-n-roll-out.service"
 PW_CONF_NAME = "rock-n-roll-out.conf"
-NODE_NAME = "rock-n-roll-out"
+NODE_NAME = "rock-n-roll-out"            # sortie « Hifi » (horloge propre, 192 kHz)
+RTP_NODE = "rock-n-roll-out.rtp"         # émetteur : capture le moniteur de la sortie
 PC_PW = "pipewire/pipewire.conf.d/60-rock-n-roll-out.conf"
 PC_WP05 = "wireplumber/wireplumber.conf.d/60-rock-n-roll-out-spdif.conf"
 PC_WP04 = "wireplumber/main.lua.d/60-rock-n-roll-out-spdif.lua"
@@ -43,7 +44,7 @@ HEADER = ("# Généré par rock-n-roll-pw-out depuis %s\n"
 DEFAULTS = {
     "rtp": {"host": "hifi.local", "port": "46000", "rate": "192000", "format": "S24BE",
             "channels": "2", "ptime-ms": "1", "latency-ms": "10", "hold": "no",
-            "description": "Hifi — réseau (RTP 192 kHz)"},
+            "description": "Hifi — réseau (RTP 192 kHz)", "log-level": "2"},
     "pc": {"spdif-rate": "96000", "spdif-match": r"~alsa_output\..*iec958.*",
            "allowed-rates": "44100 48000 88200 96000 176400 192000"},
 }
@@ -92,6 +93,8 @@ class Config:
             die("[rtp] format doit valoir %s" % " ou ".join(FORMATS))
         if int(r["latency-ms"]) % int(r["ptime-ms"]):
             die("[rtp] latency-ms doit être un multiple de ptime-ms")
+        if r["log-level"] not in ("0", "1", "2", "3", "4", "5"):
+            die("[rtp] log-level doit être un entier de 0 à 5")
         if not r["host"] or any(ch.isspace() for ch in r["host"]):
             die("[rtp] host invalide")
         self.frames = int(r["rate"]) * int(r["ptime-ms"]) // 1000
@@ -148,20 +151,30 @@ def positions(n):
 
 
 def gen_sender(c, ip):
-    """Processus PipeWire à part : l'émetteur RTP (une sortie « Hifi »)."""
+    """Processus PipeWire à part : l'émetteur RTP. Il ne convertit rien : il capture
+    le moniteur de la sortie « Hifi », qui a sa propre horloge à la fréquence RTP.
+    (Avant : l'émetteur était lui-même la sortie ; piloté par une carte son à une
+    autre fréquence, le S/PDIF à 96 kHz, il convertissait et perdait des paquets.)"""
     r = c.rtp
     ptime = int(r["ptime-ms"])
     stream = {
-        "node.name": NODE_NAME,
-        "node.description": r["description"],
-        "media.class": "Audio/Sink",
+        "node.name": RTP_NODE,
+        "node.description": r["description"] + " : émetteur",
+        "media.class": "Stream/Input/Audio",
+        "target.object": NODE_NAME,
+        "stream.capture.sink": True,
+        "node.dont-reconnect": False,
+        "node.force-rate": int(r["rate"]),
     }
     if yes(r["hold"]):
         # envoyer (du silence) même quand rien ne joue : la Pi reste à ce PC
         stream["node.always-process"] = True
-        stream["session.suspend-timeout-seconds"] = 0
+    else:
+        # lien passif : quand rien ne joue sur « Hifi », tout se met en veille,
+        # plus aucun paquet ne part et la Pi libère la place
+        stream["node.passive"] = True
     return doc(c, {
-        "context.properties": {"log.level": 0},
+        "context.properties": {"log.level": int(r["log-level"])},
         "context.spa-libs": {
             "audio.convert.*": "audioconvert/libspa-audioconvert",
             "support.*": "support/libspa-support",
@@ -194,7 +207,33 @@ def gen_sender(c, ip):
 
 
 def gen_pc_pipewire(c):
-    return doc(c, {"context.properties": {"default.clock.allowed-rates": c.allowed}})
+    """Fréquences autorisées + la sortie « Hifi » : sortie virtuelle qui est sa
+    propre horloge, à la fréquence RTP. Les applications y sont converties une
+    seule fois ; elle ne partage pas l'horloge de la carte son (S/PDIF à 96 kHz)."""
+    r = c.rtp
+    sink = {
+        "factory.name": "support.null-audio-sink",
+        "node.name": NODE_NAME,
+        "node.description": r["description"],
+        "media.class": "Audio/Sink",
+        "audio.rate": int(r["rate"]),
+        "audio.channels": int(r["channels"]),
+        "audio.position": positions(int(r["channels"])),
+        "node.rate": "1/%s" % r["rate"],
+        "node.force-rate": int(r["rate"]),
+        "node.driver": True,
+        "priority.driver": 1,
+        # volume et coupure de « Hifi » appliqués à ce qui part vers la Pi
+        "monitor.channel-volumes": True,
+        "object.linger": True,
+    }
+    if yes(r["hold"]):
+        sink["node.pause-on-idle"] = False
+        sink["session.suspend-timeout-seconds"] = 0
+    return doc(c, {
+        "context.properties": {"default.clock.allowed-rates": c.allowed},
+        "context.objects": [{"factory": "adapter", "args": sink}],
+    })
 
 
 def spdif_on(c):
@@ -361,14 +400,14 @@ def cmd_apply(c, restart_pipewire=None):
     print("  sortie « %s » prête : choisissez-la dans les réglages du son" % c.rtp["description"])
 
 
-def node_state():
+def node_state(name=NODE_NAME):
     try:
         objs = json.loads(subprocess.run(["pw-dump"], text=True, capture_output=True, timeout=10).stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
     for o in objs:
         info = o.get("info") or {}
-        if (info.get("props") or {}).get("node.name") == NODE_NAME:
+        if (info.get("props") or {}).get("node.name") == name:
             return info.get("state", "?")
     return False
 
@@ -418,6 +457,10 @@ def cmd_status(c):
     states = {"running": "envoi en cours", "idle": "prête, rien ne joue", "suspended": "en veille (rien ne joue)"}
     print("  sortie      : %s" % ("PipeWire ne répond pas" if st is None else
                                    "absente" if st is False else states.get(st, st)))
+    e = node_state(RTP_NODE)
+    if st is not None:
+        print("  émetteur    : %s" % ("absent (systemctl --user status %s)" % UNIT if e is False
+                                       else "relié à la sortie (%s)" % e))
     d = default_sink()
     if d:
         print("  par défaut  : %s" % ("oui" if d == NODE_NAME else "non (%s)" % d))

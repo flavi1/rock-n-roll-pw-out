@@ -21,8 +21,17 @@ grep -q 'destination.ip = "192.168.1.113"' "$S" && ok "vers l'adresse résolue" 
 grep -q 'destination.port = 46000' "$S" && ok "port 46000 (= pw-in)" || fail "port"
 grep -q 'audio.rate = 192000' "$S" && grep -q 'audio.format = "S24BE"' "$S" && ok "192 kHz / 24 bits" || fail "format"
 grep -q 'rtp.ptime = 1' "$S" && grep -q 'sess.max-ptime = 1' "$S" && ok "paquets de 1 ms (1192 octets < 1280)" || fail "ptime"
-grep -q 'media.class = "Audio/Sink"' "$S" && ok "sortie son visible" || fail "media.class"
+grep -q 'media.class = "Stream/Input/Audio"' "$S" && grep -q 'target.object = "rock-n-roll-out"' "$S" \
+    && grep -q 'stream.capture.sink = true' "$S" && ok "émetteur : capture du moniteur de « Hifi »" || fail "émetteur"
+grep -q 'node.force-rate = 192000' "$S" && ok "émetteur à 192 kHz sans conversion" || fail "force-rate émetteur"
+grep -q 'log.level = 2' "$S" && ok "journal : avertissements" || fail "log.level"
 grep -q 'node.always-process' "$S" && fail "hold = no : ne doit pas garder la place" || ok "place libérée quand rien ne joue"
+grep -q 'node.passive = true' "$S" && ok "lien passif : veille quand rien ne joue" || fail "node.passive"
+P="$W/g/pipewire/pipewire.conf.d/60-rock-n-roll-out.conf"
+grep -q 'factory.name = "support.null-audio-sink"' "$P" && grep -q 'node.name = "rock-n-roll-out"' "$P" \
+    && grep -q 'media.class = "Audio/Sink"' "$P" && ok "sortie « Hifi » : horloge propre" || fail "sortie virtuelle"
+grep -q 'audio.rate = 192000' "$P" && grep -q 'node.force-rate = 192000' "$P" && ok "sortie « Hifi » à 192 kHz" || fail "fréquence sortie"
+grep -q 'monitor.channel-volumes = true' "$P" && ok "volume de « Hifi » appliqué au flux" || fail "volume"
 grep -q 'ExecStartPre=%h/.local/bin/rock-n-roll-pw-out prepare' "$W/g/systemd/user/rock-n-roll-out.service" \
     && ok "adresse résolue à chaque démarrage" || fail "ExecStartPre"
 grep -q 'default.clock.allowed-rates = \[ 44100 48000 88200 96000 176400 192000 \]' \
@@ -46,6 +55,8 @@ echo "== options"
 sed -i 's/^hold = no/hold = yes/; s/^spdif-rate = 96000/spdif-rate = no/' "$PW_OUT_CONF"
 "${CMD[@]}" generate "$W/g2" 10.0.0.5 0.5 >/dev/null
 grep -q 'node.always-process = true' "$W/g2/pipewire/rock-n-roll-out.conf" && ok "hold = yes : silence envoyé" || fail "hold"
+grep -q 'node.passive' "$W/g2/pipewire/rock-n-roll-out.conf" && fail "hold = yes : lien passif" || ok "hold = yes : lien actif"
+grep -q 'node.pause-on-idle = false' "$W/g2/pipewire/pipewire.conf.d/60-rock-n-roll-out.conf" && ok "hold = yes : sortie jamais en veille" || fail "hold sortie"
 [[ ! -e "$W/g2/wireplumber/wireplumber.conf.d/60-rock-n-roll-out-spdif.conf" ]] && ok "spdif-rate = no : S/PDIF non modifié" || fail "spdif no"
 cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
 

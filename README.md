@@ -35,14 +35,16 @@ Désinstallation : `bash rock-n-roll-pw-out/uninstall.sh` (`--purge` : aussi la 
 | `~/.config/rock-n-roll-pw-out/pw-out.conf` | configuration (conservée d'une installation à l'autre) |
 | `~/.local/bin/rock-n-roll-pw-out` | commande : `apply`, `status`, `default`, `check` |
 | `~/.config/systemd/user/rock-n-roll-out.service` | l'émetteur, dans un processus PipeWire à part, démarré avec la session |
-| `~/.config/pipewire/pipewire.conf.d/60-rock-n-roll-out.conf` | fréquences autorisées : 44,1 à 192 kHz (remplace un ancien réglage à la main, ex. `50-96khz.conf`) |
+| `~/.config/pipewire/pipewire.conf.d/60-rock-n-roll-out.conf` | la sortie « Hifi » (sortie virtuelle à 192 kHz, sa propre horloge) et les fréquences autorisées : 44,1 à 192 kHz (remplace un ancien réglage à la main, ex. `50-96khz.conf`) |
 | `~/.config/wireplumber/…/60-rock-n-roll-out-spdif.*` | S/PDIF fixé à 96 kHz (règle WirePlumber 0.5 ou 0.4 selon la version) |
 
 ## Fonctionnement
 
-- Format **fixe** des deux côtés : 192 kHz / 24 bits / stéréo. PipeWire convertit ce
-  que joue le PC (44,1 kHz, 48 kHz…) sur le PC. La Pi n'a jamais à changer de format :
-  pas de coupure ni de renégociation entre deux morceaux.
+- Format **fixe** des deux côtés : 192 kHz / 24 bits / stéréo. La sortie « Hifi » est
+  une sortie virtuelle qui a **sa propre horloge à 192 kHz**, indépendante de la carte
+  son : ce que joue le PC (44,1 kHz, 48 kHz…) y est converti **une seule fois**,
+  l'émetteur envoie ensuite tel quel. La Pi n'a jamais à changer de format : pas de
+  coupure ni de renégociation entre deux morceaux.
 - La **carte S/PDIF du PC reste à 96 kHz** quoi qu'il arrive (votre récepteur
   numérique ne renégocie pas).
 - Paquets de 1 ms (1192 octets) : sous la taille d'un paquet réseau, aucune
@@ -76,7 +78,7 @@ rock-n-roll-pw-out status
 | Sortie absente | `systemctl --user status rock-n-roll-out`, `journalctl --user -u rock-n-roll-out` |
 | Pas de son sur la Pi | sur la Pi : `sudo rock-n-roll-pw-in status` (un autre PC tient la place ?) |
 | La sortie S/PDIF change de fréquence | `pw-top` ; nom du nœud : `wpctl status`, `wpctl inspect ID`, puis `spdif-match` dans `pw-out.conf` et `rock-n-roll-pw-out apply` |
-| Son haché | Wi-Fi ou réseau chargé : sur la Pi, `latency-ms` plus grand (`local.conf`) |
+| Son haché | `pw-top` pendant la lecture : la ligne `rock-n-roll-out` (pilote) doit être à 192000 ; sur la Pi, compter les paquets reçus (≈ 1000/s attendus) ; journal : `log-level = 3` dans `pw-out.conf`, `rock-n-roll-pw-out apply`, `journalctl --user -u rock-n-roll-out -f` ; Wi-Fi chargé : sur la Pi, `latency-ms` plus grand (`local.conf`) |
 
 ## Tests
 
