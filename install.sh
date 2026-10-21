@@ -90,7 +90,6 @@ done
 
 # --- Démarrage --------------------------------------------------------------------------
 log "Démarrage de l'envoi (PipeWire redémarre si les fréquences changent : coupure d'1 s)"
-"$BIN" check
 "$BIN" apply
 [[ $MAKE_DEFAULT -eq 0 ]] || "$BIN" default
 

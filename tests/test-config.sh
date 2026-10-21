@@ -86,7 +86,7 @@ echo "== install.sh : options écrites dans pw-out.conf"
 export HOME="$W/home" XDG_CONFIG_HOME="$W/home/.config"
 mkdir -p "$HOME"
 # faux environnement : on s'arrête avant le démarrage
-sed -e 's#^"\$BIN" check#exit 0#' "$HERE/install.sh" > "$W/inst.sh"
+sed -e 's#^"\$BIN" apply#exit 0#' "$HERE/install.sh" > "$W/inst.sh"
 mkdir -p "$W/fakebin"
 for b in pipewire wireplumber; do printf '#!/bin/sh\nexit 0\n' > "$W/fakebin/$b"; chmod +x "$W/fakebin/$b"; done
 # module RTP absent ici : on neutralise ce test
