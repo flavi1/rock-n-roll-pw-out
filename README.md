@@ -1,5 +1,7 @@
 # rock-n-roll-pw-out
 
+> **VIBE CODÉ ET NON TESTÉS.** La liaison RTP sans ROC fonctionne chez moi de façon stable.
+
 Envoie le son d'un PC Linux (PipeWire : Kubuntu, Ubuntu, Fedora, Debian…) vers la
 Raspberry Pi hifi par le réseau local, **sans perte et sans compression** :
 RTP, 192 kHz / 24 bits. Côté Pi : [rock-n-roll-pw-in](https://github.com/flavi1/rock-n-roll-pw-in).
