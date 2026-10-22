@@ -9,7 +9,7 @@ W="$(mktemp -d)"; trap 'rm -rf "$W"' EXIT
 FAILS=0
 ok()   { echo "  ok   : $*"; }
 fail() { echo "  FAIL : $*"; FAILS=$((FAILS+1)); }
-export PW_OUT_CONF="$W/pw-out.conf"
+export PW_OUT_CONF="$W/pw-out.conf" PW_OUT_ROC_BIN="$W/absent"
 cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
 
 echo "== check / generate"
@@ -51,6 +51,40 @@ assert all(f[x] is None for x in m.OLD_FILES) and f[m.PC_PW]
 PY
 cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
 
+echo "== ROC"
+P="$W/g/pipewire/pipewire.conf.d/60-rock-n-roll-out.conf"
+grep -q 'rock-n-roll-out-roc' "$P" && fail "ROC indisponible : pas de sortie ROC" || ok "ROC indisponible : seule la sortie RTP"
+"${CMD[@]}" check | grep -q "ROC.*INDISPONIBLE" && ok "ROC indisponible : signalé" || fail "ROC indisponible non signalé"
+printf '#!/bin/sh\nexit 0\n' > "$W/roc"; chmod +x "$W/roc"
+PW_OUT_ROC_BIN="$W/roc" "${CMD[@]}" generate "$W/gr" 192.168.1.113 >/dev/null
+PR="$W/gr/pipewire/pipewire.conf.d/60-rock-n-roll-out.conf"
+[[ "$(grep -c 'factory.name = "support.null-audio-sink"' "$PR")" -eq 2 ]] && grep -q 'node.name = "rock-n-roll-out-roc"' "$PR" \
+    && ok "deux sorties « Hifi » (RTP, ROC), chacune sa propre horloge" || fail "sortie ROC"
+grep -q 'ExecStart=%h/.local/bin/rock-n-roll-pw-out run-roc' "$W/gr/systemd/user/rock-n-roll-out-roc.service" \
+    && grep -q 'StartLimitBurst=5' "$W/gr/systemd/user/rock-n-roll-out-roc.service" \
+    && ok "service ROC séparé, redémarrages limités" || fail "service ROC"
+python3 - "$W/gr/roc-argv.json" <<'PY' && ok "commande ROC : moniteur de « Hifi — ROC », lien passif, 192 kHz, vers l'IP" || fail "argv ROC"
+import json, sys
+a = json.load(open(sys.argv[1]))
+assert a[1] == "send" and a[a.index("--host") + 1] == "192.168.1.113"
+assert a[a.index("--fec") + 1] == "auto" and a[a.index("--rate") + 1] == "192000"
+pw = a[a.index("--") + 1:]
+assert pw[:2] == ["pw-record", "--raw"] and pw[pw.index("--target") + 1] == "rock-n-roll-out-roc"
+p = json.loads(pw[pw.index("-P") + 1])
+assert p["stream.capture.sink"] is True and p["node.passive"] is True and "node.always-process" not in p
+PY
+sed -i 's/^hold = no/hold = yes/' "$PW_OUT_CONF"
+PW_OUT_ROC_BIN="$W/roc" "${CMD[@]}" generate "$W/gr2" 192.168.1.113 >/dev/null
+python3 -c "import json,sys;a=json.load(open(sys.argv[1]));p=json.loads(a[a.index('-P')+1]);assert p['node.always-process'] is True and 'node.passive' not in p" "$W/gr2/roc-argv.json" \
+    && ok "hold = yes : ROC garde aussi la place" || fail "hold ROC"
+cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
+printf '\n[roc]\nenabled = no\n' >> "$PW_OUT_CONF"
+"${CMD[@]}" check >/dev/null 2>&1 && fail "section [roc] en double acceptée" || ok "section en double refusée"
+cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
+sed -i '/^\[roc\]/,/^\[pc\]/s/^enabled = yes/enabled = no/' "$PW_OUT_CONF"
+"${CMD[@]}" check | grep -q "ROC         : désactivé" && ok "ROC désactivable" || fail "ROC désactivé"
+cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
+
 echo "== options"
 sed -i 's/^hold = no/hold = yes/' "$PW_OUT_CONF"
 "${CMD[@]}" generate "$W/g2" 10.0.0.5 >/dev/null
@@ -68,6 +102,8 @@ bad "fréquence invalide" 's/^rate = 192000/rate = 100000/'
 bad "paquet trop gros (fragmentation)" 's/^ptime-ms = 1/ptime-ms = 2/'
 bad "tampon non multiple" 's/^latency-ms = 10/latency-ms = 7/; s/^ptime-ms = 1/ptime-ms = 2/; s/^rate = 192000/rate = 48000/'
 bad "option inconnue" 's/^hold = no/garder = no/'
+bad "ROC : paquet trop gros" 's/^packet-us = 750/packet-us = 1500/'
+bad "ROC : fec invalide" 's/^fec = auto/fec = xor/'
 cp "$HERE/pw-out.conf" "$PW_OUT_CONF"
 sed -i 's/^rate = 192000/rate = 48000/; s/^ptime-ms = 1/ptime-ms = 2/; s/^latency-ms = 10/latency-ms = 10/' "$PW_OUT_CONF"
 "${CMD[@]}" check >/dev/null 2>&1 && ok "48 kHz, paquets de 2 ms accepté" || fail "48 kHz / 2 ms refusé"

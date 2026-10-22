@@ -23,7 +23,8 @@ Options (relancer `install.sh` pour en changer) :
 | `--host NOM\|IP` | `hifi.local` | la Pi ; un nom est résolu à chaque ouverture de session |
 | `--port N` | `46000` | port de rock-n-roll-pw-in |
 | `--hold yes\|no` | `no` | `yes` : ce PC garde la Pi même quand rien ne joue (envoi de silence) |
-| `--default` | | fait de « Hifi » la sortie par défaut |
+| `--roc yes\|no` | `yes` | seconde sortie ROC (voir plus bas) ; `no` : rien n'est compilé ni installé pour ROC |
+| `--default` | | fait de « Hifi » (RTP) la sortie par défaut |
 
 Désinstallation : `bash rock-n-roll-pw-out/uninstall.sh` (`--purge` : aussi la configuration).
 
@@ -34,6 +35,7 @@ Désinstallation : `bash rock-n-roll-pw-out/uninstall.sh` (`--purge` : aussi la 
 | `~/.config/rock-n-roll-pw-out/pw-out.conf` | configuration (conservée d'une installation à l'autre) |
 | `~/.local/bin/rock-n-roll-pw-out` | commande : `apply`, `status`, `default`, `check` |
 | `~/.config/systemd/user/rock-n-roll-out.service` | l'émetteur, dans un processus PipeWire à part, démarré avec la session |
+| `~/.local/bin/rock-n-roll-roc`, `~/.config/systemd/user/rock-n-roll-out-roc.service` | ROC (optionnel) : programme compilé par `install.sh` et son service |
 | `~/.config/pipewire/pipewire.conf.d/60-rock-n-roll-out.conf` | la sortie « Hifi » (sortie virtuelle à 192 kHz, sa propre horloge) et les fréquences autorisées : 44,1 à 192 kHz (remplace un ancien réglage à la main, ex. `50-96khz.conf`) |
 
 ## Fonctionnement
@@ -51,6 +53,31 @@ Désinstallation : `bash rock-n-roll-pw-out/uninstall.sh` (`--purge` : aussi la 
   5 s après la fin du son de l'autre. Quand rien ne joue, la sortie se met en veille
   et libère la place (sauf `--hold yes`).
 - Pas de mot de passe : seul le réseau local est accepté par la Pi.
+
+## ROC (optionnel, activé par défaut)
+
+Une seconde sortie, **« Hifi — réseau (ROC 192 kHz) »**, pour un réseau imparfait
+(Wi-Fi) : même format (192 kHz, flottant 32 bits, stéréo), mais un tampon plus grand
+(80 ms) et, si la libroc du PC le permet, la **réparation des paquets perdus**
+(Reed-Solomon). RTP reste la sortie de référence en Ethernet.
+
+- `install.sh` installe `libroc-dev` et `gcc` (mot de passe `sudo` demandé une fois),
+  puis compile le petit programme `rock-n-roll-roc`. En cas d'échec, ou avec
+  `--roc no`, il n'y a simplement pas de sortie ROC : la sortie RTP n'est jamais
+  touchée.
+- Processus à part (service `rock-n-roll-out-roc`, redémarrages limités) : une panne
+  de ROC n'affecte ni RTP ni le reste du son du PC.
+- **Correction des pertes : seulement si la libroc du PC l'a.** Debian : oui.
+  Ubuntu (24.04, 26.04) : non (bibliothèque OpenFEC absente). Le flux part alors
+  sans correction (la Pi l'accepte aussi) : ROC n'apporte plus que son tampon.
+- Même place que RTP sur la Pi : un seul émetteur à la fois, tous protocoles
+  confondus. Choisir l'une **ou** l'autre sortie, pas les deux en même temps.
+- Qualité : voir « Limitations connues ».
+
+```
+rock-n-roll-pw-out default roc     # ROC comme sortie par défaut
+rock-n-roll-pw-out default         # retour à RTP
+```
 
 ## État
 
@@ -93,6 +120,13 @@ rock-n-roll-pw-out status
 - **Wi-Fi** : utilisable si le réseau est stable ; en cas de coupures, augmenter le
   tampon de la Pi (`latency-ms` dans son `local.conf`).
 - **Une seule Pi par PC**, et un seul PC à la fois par Pi.
+- **ROC n'est pas transparent.** Pour rattraper l'écart d'horloge entre le PC et
+  la Pi, libroc rééchantillonne à la réception. À 192 kHz, seul son rééchantillonneur
+  intégré fonctionne (Speex déborde au-delà de ~65 kHz). Il amplifie de +0,9 dB
+  (corrigé par rock-n-roll-roc) et laisse un résidu de bruit et de distorsion
+  d'environ −50 dB (≈ 0,3 %), mesuré sur un sinus de 1 kHz. RTP, lui, est sans
+  perte, avec un rééchantillonnage PipeWire de qualité 10. ROC est donc un secours
+  pour le Wi-Fi, pas la sortie hifi de référence.
 
 ## Couper l'EEE (économie d'énergie Ethernet) de façon permanente
 

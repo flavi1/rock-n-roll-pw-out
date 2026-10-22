@@ -8,14 +8,18 @@
 #  rock-n-roll-pw-out apply      régénère la configuration et relance l'envoi
 #                                (+ PipeWire si la partie « PC » a changé)
 #  rock-n-roll-pw-out status     état de l'envoi
-#  rock-n-roll-pw-out default    fait de « Hifi » la sortie son par défaut
+#  rock-n-roll-pw-out default [roc]  fait de « Hifi » (RTP, ou ROC) la sortie par défaut
 #  rock-n-roll-pw-out check      valide la configuration
 #  rock-n-roll-pw-out prepare    résout l'adresse de la Pi et écrit la config
 #                                de l'émetteur (lancé à chaque démarrage)
 #  rock-n-roll-pw-out generate DIR [IP]   fichiers générés dans DIR (tests)
+#  rock-n-roll-pw-out run-roc    lance l'émetteur ROC (service rock-n-roll-out-roc)
 #
 #  L'émetteur tourne dans un processus PipeWire à part (service utilisateur
 #  rock-n-roll-out) : sa sortie « Hifi » apparaît dans les réglages du son.
+#  ROC (optionnel) : seconde sortie « Hifi — réseau (ROC 192 kHz) », avec
+#  correction des pertes si la libroc du PC l'a ; programme rock-n-roll-roc,
+#  compilé par install.sh. S'il manque, seule la sortie RTP existe.
 #  Sans utilisateur root, sans rien installer hors de votre dossier personnel.
 # =============================================================================
 import configparser
@@ -35,6 +39,11 @@ UNIT = "rock-n-roll-out.service"
 PW_CONF_NAME = "rock-n-roll-out.conf"
 NODE_NAME = "rock-n-roll-out"            # sortie « Hifi » (horloge propre, 192 kHz)
 RTP_NODE = "rock-n-roll-out.rtp"         # émetteur : capture le moniteur de la sortie
+ROC_SINK = "rock-n-roll-out-roc"         # sortie « Hifi — ROC » (horloge propre)
+ROC_NODE = "rock-n-roll-out-roc.send"    # émetteur ROC : capture son moniteur
+ROC_UNIT = "rock-n-roll-out-roc.service"
+ROC_BIN = os.environ.get("PW_OUT_ROC_BIN", os.path.join(HOME, ".local", "bin", "rock-n-roll-roc"))
+FECS = ("auto", "rs8m", "ldpc", "none")
 PC_PW = "pipewire/pipewire.conf.d/60-rock-n-roll-out.conf"
 # Anciennes versions : règle S/PDIF installée d'office (retirée : propre à chaque PC,
 # voir README « Fixer la fréquence d'une carte son »). Supprimées à « apply ».
@@ -48,6 +57,9 @@ DEFAULTS = {
     "rtp": {"host": "hifi.local", "port": "46000", "rate": "192000", "format": "S24BE",
             "channels": "2", "ptime-ms": "1", "latency-ms": "10", "hold": "no",
             "description": "Hifi — réseau (RTP 192 kHz)", "log-level": "2"},
+    "roc": {"enabled": "yes", "source-port": "10001", "repair-port": "10002",
+            "plain-port": "10003", "fec": "auto", "packet-us": "750", "rate": "192000",
+            "description": "Hifi — réseau (ROC 192 kHz)"},
     "pc": {"allowed-rates": "44100 48000 88200 96000 176400 192000"},
 }
 RATES = (44100, 48000, 88200, 96000, 176400, 192000)
@@ -107,12 +119,24 @@ class Config:
         self.packet = self.frames * FORMATS[r["format"]] * int(r["channels"]) + IP_UDP_RTP
         if self.packet > MTU:
             die("[rtp] paquets de %d octets > %d (fragmentation) : réduisez ptime-ms" % (self.packet, MTU))
+        o = self.v["roc"]
+        for k, lo, hi in (("source-port", 1024, 65535), ("repair-port", 1024, 65535),
+                          ("plain-port", 1024, 65535), ("packet-us", 100, 20000)):
+            if not o[k].isdigit() or not lo <= int(o[k]) <= hi:
+                die("[roc] %s doit être un entier entre %d et %d" % (k, lo, hi))
+        if not o["rate"].isdigit() or int(o["rate"]) not in RATES:
+            die("[roc] rate doit valoir %s" % ", ".join(map(str, RATES)))
+        if o["fec"] not in FECS:
+            die("[roc] fec doit valoir %s" % ", ".join(FECS))
+        if int(o["rate"]) * int(o["packet-us"]) // 1000000 * 8 + 56 > 1472:
+            die("[roc] packet-us trop grand : le paquet dépasserait 1472 octets (fragmentation)")
         rates = p["allowed-rates"].replace(",", " ").split()
         if not rates or any(not x.isdigit() or int(x) not in RATES for x in rates):
             die("[pc] allowed-rates : liste parmi %s" % ", ".join(map(str, RATES)))
         self.allowed = [int(x) for x in rates]
-        if int(r["rate"]) not in self.allowed:
-            self.allowed = sorted(set(self.allowed) | {int(r["rate"])})
+        for need in (int(r["rate"]), int(o["rate"])):
+            if need not in self.allowed:
+                self.allowed = sorted(set(self.allowed) | {need})
 
     @property
     def rtp(self):
@@ -121,6 +145,22 @@ class Config:
     @property
     def pc(self):
         return self.v["pc"]
+
+    @property
+    def roc(self):
+        return self.v["roc"]
+
+    @property
+    def roc_wanted(self):
+        return yes(self.roc["enabled"])
+
+    @property
+    def roc_available(self):
+        return os.access(ROC_BIN, os.X_OK)
+
+    @property
+    def roc_enabled(self):
+        return self.roc_wanted and self.roc_available
 
 
 # --- SPA-JSON ------------------------------------------------------------------------
@@ -209,33 +249,41 @@ def gen_sender(c, ip):
     })
 
 
-def gen_pc_pipewire(c):
-    """Fréquences autorisées + la sortie « Hifi » : sortie virtuelle qui est sa
-    propre horloge, à la fréquence RTP. Les applications y sont converties une
-    seule fois ; elle ne partage pas l'horloge de la carte son du PC."""
-    r = c.rtp
+def hifi_sink(c, name, description, rate, channels):
+    """Sortie virtuelle qui est sa propre horloge, à la fréquence d'envoi. Les
+    applications y sont converties une seule fois ; elle ne partage pas l'horloge
+    de la carte son du PC."""
     sink = {
         "factory.name": "support.null-audio-sink",
-        "node.name": NODE_NAME,
-        "node.description": r["description"],
+        "node.name": name,
+        "node.description": description,
         "media.class": "Audio/Sink",
-        "audio.rate": int(r["rate"]),
-        "audio.channels": int(r["channels"]),
-        "audio.position": positions(int(r["channels"])),
-        "node.rate": "1/%s" % r["rate"],
-        "node.force-rate": int(r["rate"]),
+        "audio.rate": rate,
+        "audio.channels": channels,
+        "audio.position": positions(channels),
+        "node.rate": "1/%d" % rate,
+        "node.force-rate": rate,
         "node.driver": True,
         "priority.driver": 1,
         # volume et coupure de « Hifi » appliqués à ce qui part vers la Pi
         "monitor.channel-volumes": True,
         "object.linger": True,
     }
-    if yes(r["hold"]):
+    if yes(c.rtp["hold"]):
         sink["node.pause-on-idle"] = False
         sink["session.suspend-timeout-seconds"] = 0
+    return {"factory": "adapter", "args": sink}
+
+
+def gen_pc_pipewire(c):
+    """Fréquences autorisées + les sorties « Hifi » (RTP ; ROC si disponible)."""
+    r = c.rtp
+    objects = [hifi_sink(c, NODE_NAME, r["description"], int(r["rate"]), int(r["channels"]))]
+    if c.roc_enabled:
+        objects.append(hifi_sink(c, ROC_SINK, c.roc["description"], int(c.roc["rate"]), 2))
     return doc(c, {
         "context.properties": {"default.clock.allowed-rates": c.allowed},
-        "context.objects": [{"factory": "adapter", "args": sink}],
+        "context.objects": objects,
     })
 
 
@@ -258,6 +306,54 @@ RestartSec=10
 [Install]
 WantedBy=default.target
 """.replace("{conf}", PW_CONF_NAME)
+
+
+def gen_roc_unit():
+    return """# Généré par rock-n-roll-pw-out
+# Émetteur ROC (pw-record + rock-n-roll-roc), processus à part : une panne ici ne
+# touche ni RTP ni le reste du son du PC. Redémarrages limités.
+[Unit]
+Description=rock-n-roll : envoi du son vers la Pi (ROC)
+After=pipewire.service wireplumber.service
+Requires=pipewire.service
+PartOf=pipewire.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+ExecStart=%h/.local/bin/rock-n-roll-pw-out run-roc
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def roc_argv(c, ip):
+    """Commande de l'émetteur ROC : moniteur de « Hifi — ROC » -> pw-record ->
+    rock-n-roll-roc -> réseau."""
+    o, hold = c.roc, yes(c.rtp["hold"])
+    props = {
+        "node.name": ROC_NODE,
+        "node.description": o["description"] + " : émetteur",
+        "stream.capture.sink": True,
+        "node.force-rate": int(o["rate"]),
+    }
+    if hold:
+        props["node.always-process"] = True
+    else:
+        # lien passif : rien ne joue -> veille, plus aucun paquet, la Pi libère la place
+        props["node.passive"] = True
+    argv = [ROC_BIN, "send", "--host", ip, "--source-port", o["source-port"],
+            "--repair-port", o["repair-port"], "--plain-port", o["plain-port"],
+            "--fec", o["fec"], "--rate", o["rate"], "--packet-us", o["packet-us"]]
+    if int(c.rtp["log-level"]) >= 3:
+        argv.append("-v")
+    argv += ["--", "pw-record", "--raw", "--format", "f32", "--rate", o["rate"], "--channels", "2",
+             "--target", ROC_SINK, "--latency", "10ms",
+             "-P", json.dumps(props, ensure_ascii=False), "-"]
+    return argv
 
 
 def pc_files(c):
@@ -307,8 +403,17 @@ def cmd_check(c):
     print("  format      : %s Hz %s %s canaux, paquets de %s ms (%d octets), tampon %s ms%s" % (
         r["rate"], r["format"], r["channels"], r["ptime-ms"], c.packet, r["latency-ms"],
         ", place gardée même sans son" if yes(r["hold"]) else ""))
-    for o in c.obsolete:
-        print("  ignoré      : %s (n'existe plus : voir README, « Fixer la fréquence d'une carte son »)" % o)
+    o = c.roc
+    if not c.roc_wanted:
+        print("  ROC         : désactivé")
+    else:
+        fec = {"auto": "correction rs8m si la libroc l'a, sinon flux simple", "rs8m": "correction rs8m",
+               "ldpc": "correction LDPC", "none": "sans correction"}[o["fec"]]
+        print("  ROC         : %s Hz f32 stéréo, %s, paquets de %s µs%s" % (
+            o["rate"], fec, o["packet-us"],
+            "" if c.roc_available else " — INDISPONIBLE (%s absent : relancez install.sh)" % ROC_BIN))
+    for x in c.obsolete:
+        print("  ignoré      : %s (n'existe plus : voir README, « Fixer la fréquence d'une carte son »)" % x)
 
 
 def cmd_prepare(c):
@@ -321,7 +426,9 @@ def cmd_prepare(c):
 
 
 def cmd_generate(c, outdir, ip="192.0.2.10"):
-    files = {"pipewire/" + PW_CONF_NAME: gen_sender(c, ip), "systemd/user/" + UNIT: gen_unit()}
+    files = {"pipewire/" + PW_CONF_NAME: gen_sender(c, ip), "systemd/user/" + UNIT: gen_unit(),
+             "systemd/user/" + ROC_UNIT: gen_roc_unit(),
+             "roc-argv.json": json.dumps(roc_argv(c, ip), ensure_ascii=False)}
     files.update(pc_files(c))
     for rel, content in files.items():
         if content is None:
@@ -345,6 +452,7 @@ def cmd_apply(c, restart_pipewire=None):
             write(p, content)
             changed = True
     write(os.path.join(XDG, "systemd", "user", UNIT), gen_unit())
+    write(os.path.join(XDG, "systemd", "user", ROC_UNIT), gen_roc_unit())
     user_ctl("daemon-reload")
     user_ctl("enable", UNIT)
     if restart_pipewire is None:
@@ -359,8 +467,21 @@ def cmd_apply(c, restart_pipewire=None):
         j = subprocess.run(["journalctl", "--user", "-u", UNIT, "-n", "5", "-o", "cat", "--no-pager"],
                            text=True, capture_output=True).stdout
         die("l'envoi n'a pas démarré :\n" + j)
+    if c.roc_enabled:
+        user_ctl("reset-failed", ROC_UNIT)
+        user_ctl("enable", ROC_UNIT)
+        r = user_ctl("restart", ROC_UNIT)
+        if r.returncode != 0:
+            print("  ATTENTION : l'envoi ROC n'a pas démarré (RTP fonctionne) : "
+                  "journalctl --user -u %s" % ROC_UNIT)
+    else:
+        user_ctl("disable", "--now", ROC_UNIT)
+        if c.roc_wanted:
+            print("  ROC indisponible (%s absent) : seule la sortie RTP existe" % ROC_BIN)
     time.sleep(1)
     print("  sortie « %s » prête : choisissez-la dans les réglages du son" % c.rtp["description"])
+    if c.roc_enabled:
+        print("  sortie « %s » prête aussi" % c.roc["description"])
 
 
 def node_state(name=NODE_NAME):
@@ -385,28 +506,29 @@ def default_sink():
     return m.group(1) if m else None
 
 
-def node_id():
+def node_id(name=NODE_NAME):
     try:
         objs = json.loads(subprocess.run(["pw-dump"], text=True, capture_output=True, timeout=10).stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired):
         return None
     for o in objs:
-        if ((o.get("info") or {}).get("props") or {}).get("node.name") == NODE_NAME:
+        if ((o.get("info") or {}).get("props") or {}).get("node.name") == name:
             return o.get("id")
     return None
 
 
-def cmd_default(c):
+def cmd_default(c, name=NODE_NAME):
+    desc = c.roc["description"] if name == ROC_SINK else c.rtp["description"]
     for _ in range(10):
-        i = node_id()
+        i = node_id(name)
         if i is not None:
             break
         time.sleep(1)
     else:
-        die("sortie « %s » absente (rock-n-roll-pw-out status)" % c.rtp["description"])
+        die("sortie « %s » absente (rock-n-roll-pw-out status)" % desc)
     if subprocess.run(["wpctl", "set-default", str(i)]).returncode != 0:
         die("wpctl set-default a échoué")
-    print("  « %s » est la sortie par défaut" % c.rtp["description"])
+    print("  « %s » est la sortie par défaut" % desc)
 
 
 def cmd_status(c):
@@ -424,9 +546,14 @@ def cmd_status(c):
     if st is not None:
         print("  émetteur    : %s" % ("absent (systemctl --user status %s)" % UNIT if e is False
                                        else "relié à la sortie (%s)" % e))
+    if c.roc_wanted:
+        print("  service ROC : %s" % (user_ctl("is-active", ROC_UNIT).stdout.strip() or "inconnu"))
+        rs = node_state(ROC_SINK)
+        if rs is not None:
+            print("  sortie ROC  : %s" % ("absente" if rs is False else states.get(rs, rs)))
     d = default_sink()
     if d:
-        print("  par défaut  : %s" % ("oui" if d == NODE_NAME else "non (%s)" % d))
+        print("  par défaut  : %s" % ("RTP" if d == NODE_NAME else "ROC" if d == ROC_SINK else "autre (%s)" % d))
 
 
 def main():
@@ -447,7 +574,15 @@ def main():
     elif a[0] == "apply":
         cmd_apply(c, True if "--restart-pipewire" in a else None)
     elif a[0] == "default":
-        cmd_default(c)
+        cmd_default(c, ROC_SINK if a[1:2] == ["roc"] else NODE_NAME)
+    elif a[0] == "run-roc":
+        if not c.roc_available:
+            die("%s absent : ROC indisponible (relancez install.sh)" % ROC_BIN)
+        ip = resolve(c.rtp["host"])
+        if not ip:
+            die("« %s » introuvable sur le réseau" % c.rtp["host"])
+        argv = roc_argv(c, ip)
+        os.execv(argv[0], argv)
     elif a[0] == "status":
         cmd_status(c)
     else:

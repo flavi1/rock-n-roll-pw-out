@@ -40,3 +40,14 @@ jobs:
           for f in /tmp/g/pipewire/rock-n-roll-out.conf /tmp/g/pipewire/pipewire.conf.d/*.conf; do
             spa-json-dump "$f" >/dev/null && echo "ok : $f"
           done
+
+  roc:
+    name: ROC (compilation, libroc 0.3)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq libroc-dev pkg-config >/dev/null
+      - name: "Compilation sans avertissement (essais réels : dépôt rock-n-roll-pw-in)"
+        run: |
+          gcc -std=c99 -O2 -Wall -Wextra -Werror -o rock-n-roll-roc files/rock-n-roll-roc.c $(pkg-config --cflags --libs roc) -lm
+          { ./rock-n-roll-roc || true; } 2>&1 | grep -q usage

@@ -7,7 +7,7 @@
 #  À lancer SANS sudo, avec votre compte (celui qui écoute la musique) :
 #
 #     bash install.sh [--host hifi.local] [--port 46000]
-#                     [--hold yes|no] [--default]
+#                     [--hold yes|no] [--roc yes|no] [--default]
 #
 #  Ajoute une sortie « Hifi — réseau (RTP 192 kHz) » dans les réglages du son
 #  (--default : en fait la sortie par défaut).
@@ -32,6 +32,7 @@ while [[ $# -gt 0 ]]; do
         --host) SET[rtp.host]="${2:?}"; shift 2 ;;
         --port) SET[rtp.port]="${2:?}"; shift 2 ;;
         --hold) SET[rtp.hold]="${2:?}"; shift 2 ;;
+        --roc) SET[roc.enabled]="${2:?}"; shift 2 ;;
         --default) MAKE_DEFAULT=1; shift ;;
         -h|--help) sed -n '3,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) die "option inconnue : $1 (--help)" ;;
@@ -88,6 +89,47 @@ for f in "${XDG_CONFIG_HOME:-$HOME/.config}"/pipewire/pipewire.conf.d/*.conf; do
     fi
 done
 
+# --- ROC (optionnel) -------------------------------------------------------------------
+# Programme rock-n-roll-roc compilé ici (libroc + gcc). Échec : seule la sortie RTP
+# existe, rien d'autre n'est touché. Recompilé si le source ou libroc change.
+ROC_BIN="$HOME/.local/bin/rock-n-roll-roc"
+ROC_SRC="$HERE/files/rock-n-roll-roc.c"
+ROC_STAMP="$CFG_DIR/roc.stamp"
+roc_deps_ok() { command -v gcc >/dev/null && pkg-config --exists roc 2>/dev/null; }
+if "$BIN" check | grep -q '^  ROC         : désactivé'; then
+    rm -f "$ROC_BIN" "$ROC_STAMP"
+else
+    log "ROC : programme rock-n-roll-roc (libroc)"
+    if ! roc_deps_ok && command -v apt-get >/dev/null; then
+        if [[ -t 0 ]]; then
+            echo "   paquets nécessaires : gcc libc6-dev libroc-dev pkg-config (mot de passe sudo demandé ;"
+            echo "   Ctrl+C puis « bash install.sh --roc no » pour s'en passer)"
+            sudo apt-get install -y gcc libc6-dev libroc-dev pkg-config || warn "installation des paquets refusée ou impossible"
+        else
+            warn "paquets manquants : sudo apt install gcc libc6-dev libroc-dev pkg-config, puis relancer install.sh"
+        fi
+    fi
+    if roc_deps_ok; then
+        want="$(sha256sum "$ROC_SRC" | cut -d' ' -f1) $(pkg-config --modversion roc)"
+        if [[ ! -x "$ROC_BIN" || "$(cat "$ROC_STAMP" 2>/dev/null)" != "$want" ]]; then
+            # shellcheck disable=SC2046
+            if gcc -std=c99 -O2 -Wall -o "$ROC_BIN.new" "$ROC_SRC" $(pkg-config --cflags --libs roc) -lm; then
+                mv -f "$ROC_BIN.new" "$ROC_BIN"
+                echo "$want" > "$ROC_STAMP"
+                echo "   compilé (libroc $(pkg-config --modversion roc))"
+            else
+                rm -f "$ROC_BIN.new"
+                warn "compilation impossible : ROC indisponible, la sortie RTP fonctionne normalement"
+            fi
+        else
+            echo "   déjà à jour"
+        fi
+    else
+        warn "libroc ou gcc absents : ROC indisponible, la sortie RTP fonctionne normalement"
+        [[ -x "$ROC_BIN" ]] && echo "   (programme déjà compilé conservé)"
+    fi
+fi
+
 # --- Démarrage --------------------------------------------------------------------------
 log "Démarrage de l'envoi (PipeWire redémarre si les fréquences changent : coupure d'1 s)"
 "$BIN" apply
@@ -100,5 +142,6 @@ log "Terminé"
 cat <<EOF
    Choisissez la sortie « $(sed -n 's/^description *= *//p' "$CONF" | head -1) » dans les
    réglages du son (KDE : icône du haut-parleur), ou : rock-n-roll-pw-out default
+   ROC (si disponible) : sortie « Hifi — réseau (ROC 192 kHz) », ou : rock-n-roll-pw-out default roc
    État : rock-n-roll-pw-out status
 EOF
